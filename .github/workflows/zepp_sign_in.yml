@@ -55,7 +55,7 @@ jobs:
           ZEPP_STEP_MAX: ${{ secrets.ZEPP_STEP_MAX }}
         run: |
           # 执行签到脚本并输出日志
-          python sign_in.py
+          python sign_in_keep.py
       
       # 5. 上传日志文件（可选，便于排查问题）
       - name: 上传签到日志
