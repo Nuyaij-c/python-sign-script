@@ -344,8 +344,8 @@ class BilibiliDailyTask:
         self.share_video()
         time.sleep(5)
 
-        # self.coin_video()
-        # time.sleep(5)
+        self.coin_video()
+        time.sleep(5)
 
         self.comic_task()
         time.sleep(5)
