@@ -16,17 +16,18 @@ logging.basicConfig(
 )
 
 # 从环境变量读取敏感配置（对应GitHub Secrets）
-BILI_SID = os.getenv("BILI_SID")
+# 核心修改：读取完整的B站Cookie字符串
+BILI_COOKIE = os.getenv("BILI_COOKIE")
 # 可选配置：投币视频列表（填写视频BV号，至少5个）
 COIN_VIDEO_BVS = os.getenv("COIN_VIDEO_BVS", "BV1xx411c7m8,BV1xt411o7Xu,BV17x411w7KC,BV1ex411x7Em,BV1qx411E79o").split(",")
 # 可选配置：观看/分享视频BV号
 WATCH_VIDEO_BV = os.getenv("WATCH_VIDEO_BV", "BV1xx411c7m8")
 
-# 请求头
+# 请求头（核心修改：使用完整Cookie）
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://www.bilibili.com/",
-    "Cookie": f"sid={BILI_SID}"  # 核心鉴权sid
+    "Cookie": BILI_COOKIE  # 使用完整Cookie，不再仅依赖sid
 }
 
 # 基础URL
@@ -48,6 +49,8 @@ class BilibiliDailyTask:
             if data["code"] == 0:
                 self.user_info = data["data"]
                 logging.info(f"登录成功！用户名：{self.user_info['uname']}")
+                # 提取csrf（bili_jct），用于后续需要csrf的请求
+                self.csrf = self.user_info.get("csrf", "")
                 return True
             else:
                 logging.error(f"登录失败：{data['message']}")
@@ -63,7 +66,7 @@ class BilibiliDailyTask:
             params = {
                 "entry_id": 2907,
                 "platform": "web",
-                "csrf": self.user_info.get("csrf", "") if self.user_info else ""
+                "csrf": self.csrf if hasattr(self, 'csrf') else ""  # 使用提取的csrf
             }
             resp = self.session.post(url, params=params, timeout=10)
             data = resp.json()
@@ -79,12 +82,17 @@ class BilibiliDailyTask:
         try:
             # 模拟观看视频（上报播放进度）
             url = f"{BASE_URL}/x/click-interface/web/heartbeat"
+            aid = self._get_aid_by_bv(WATCH_VIDEO_BV)
+            cid = self._get_cid_by_aid(aid)
+            if aid == 0 or cid == 0:
+                logging.error("观看视频：获取aid/cid失败，跳过任务")
+                return
             params = {
-                "aid": self._get_aid_by_bv(WATCH_VIDEO_BV),
-                "cid": self._get_cid_by_aid(self._get_aid_by_bv(WATCH_VIDEO_BV)),
+                "aid": aid,
+                "cid": cid,
                 "progress": random.randint(60, 300),  # 随机播放进度（秒）
                 "play_type": "normal",
-                "csrf": self.user_info.get("csrf", "") if self.user_info else ""
+                "csrf": self.csrf if hasattr(self, 'csrf') else ""
             }
             resp = self.session.post(url, data=params, timeout=10)
             data = resp.json()
@@ -99,9 +107,13 @@ class BilibiliDailyTask:
         """分享视频任务"""
         try:
             url = f"{BASE_URL}/x/web-interface/share/add"
+            aid = self._get_aid_by_bv(WATCH_VIDEO_BV)
+            if aid == 0:
+                logging.error("分享视频：获取aid失败，跳过任务")
+                return
             params = {
-                "aid": self._get_aid_by_bv(WATCH_VIDEO_BV),
-                "csrf": self.user_info.get("csrf", "") if self.user_info else ""
+                "aid": aid,
+                "csrf": self.csrf if hasattr(self, 'csrf') else ""
             }
             resp = self.session.post(url, params=params, timeout=10)
             data = resp.json()
@@ -118,11 +130,15 @@ class BilibiliDailyTask:
         for bv in COIN_VIDEO_BVS[:5]:  # 最多投5个
             try:
                 url = f"{BASE_URL}/x/web-interface/coin/add"
+                aid = self._get_aid_by_bv(bv)
+                if aid == 0:
+                    logging.warning(f"投币（BV：{bv}）：获取aid失败，跳过")
+                    continue
                 params = {
-                    "aid": self._get_aid_by_bv(bv),
+                    "aid": aid,
                     "multiply": 1,  # 每次投1个
                     "select_like": 1,  # 投币并点赞
-                    "csrf": self.user_info.get("csrf", "") if self.user_info else ""
+                    "csrf": self.csrf if hasattr(self, 'csrf') else ""
                 }
                 resp = self.session.post(url, params=params, timeout=10)
                 data = resp.json()
@@ -176,7 +192,7 @@ class BilibiliDailyTask:
         """友爱社签到"""
         try:
             url = "https://api.bilibili.com/x/club/user/sign"
-            resp = self.session.post(url, timeout=10)
+            resp = self.session.post(url, params={"csrf": self.csrf} if hasattr(self, 'csrf') else {}, timeout=10)
             data = resp.json()
             if data["code"] == 0:
                 logging.info("友爱社签到成功")
@@ -190,7 +206,7 @@ class BilibiliDailyTask:
         try:
             url = f"{BASE_URL}/x/revenue/v1/silver2coin/coin2silver"
             params = {
-                "csrf": self.user_info.get("csrf", "") if self.user_info else ""
+                "csrf": self.csrf if hasattr(self, 'csrf') else ""
             }
             resp = self.session.post(url, params=params, timeout=10)
             data = resp.json()
