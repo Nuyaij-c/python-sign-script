@@ -31,8 +31,8 @@ jobs:
       
       - name: 执行哔哩哔哩每日任务
         env:
-          # 敏感信息从GitHub Secrets读取
-          BILI_SID: ${{ secrets.BILI_SID }}
+          # 核心修改：读取完整Cookie
+          BILI_COOKIE: ${{ secrets.BILI_COOKIE }}
           # 可选配置（也可在Secrets中配置）
           COIN_VIDEO_BVS: ${{ secrets.COIN_VIDEO_BVS }}
           WATCH_VIDEO_BV: ${{ secrets.WATCH_VIDEO_BV }}
