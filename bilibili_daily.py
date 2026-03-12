@@ -26,7 +26,7 @@ BILI_COOKIE = os.getenv("BILI_COOKIE")
 WATCH_VIDEO_BV = os.getenv("WATCH_VIDEO_BV", DEFAULT_WATCH_BV).strip()
 COIN_VIDEO_BVS = [bv.strip() for bv in os.getenv("COIN_VIDEO_BVS", ",".join(DEFAULT_COIN_BVS)).split(",") if bv.strip()]
 
-# 超完整请求头（模拟真实浏览器）
+# 回滚到上一版本的请求头（不修改）
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
     "Referer": "https://www.bilibili.com/",
@@ -258,6 +258,55 @@ class BilibiliDailyTask:
         except Exception as e:
             logging.info(f"银瓜子兑换任务：网络异常，默认视为完成 - {str(e)}")
 
+    def query_coin_log(self):
+        """新增：按真实JSON格式解析硬币日志，验证任务是否真正成功"""
+        logging.info("=== 开始查询硬币日志（验证任务是否真正成功）===")
+        try:
+            # 硬币日志请求参数
+            url = "https://api.bilibili.com/x/member/web/coin/log"
+            params = {
+                "jsonp": "jsonp",
+                "web_location": "333.33"
+            }
+            resp = self.session.get(url, params=params, timeout=20)
+            data = self._safe_json_parse(resp)
+            
+            if data and data["code"] == 0:
+                # 按真实JSON格式解析
+                coin_data = data.get("data", {})
+                coin_logs = coin_data.get("list", [])
+                total_count = coin_data.get("count", 0)
+                
+                logging.info(f"✅ 成功获取硬币日志，共{total_count}条记录")
+                logging.info(f"📊 今日（{datetime.now().strftime('%Y-%m-%d')}）硬币变动记录：")
+                
+                # 筛选今日的硬币记录
+                today = datetime.now().strftime('%Y-%m-%d')
+                today_logs = [log for log in coin_logs if log.get("time", "").startswith(today)]
+                
+                if today_logs:
+                    for i, log in enumerate(today_logs):
+                        log_time = log.get("time", "未知时间")
+                        delta = log.get("delta", 0)  # 硬币变化量（+获得，-消耗）
+                        reason = log.get("reason", "未知操作")
+                        # 美化输出
+                        delta_str = f"+{delta}" if delta > 0 else str(delta)
+                        logging.info(f"  第{i+1}条：{log_time} | 硬币{delta_str} | 原因：{reason}")
+                    
+                    # 统计今日硬币总变动
+                    total_delta = sum([log.get("delta", 0) for log in today_logs])
+                    logging.info(f"📈 今日硬币总变动：{total_delta}（+为获得，-为消耗）")
+                else:
+                    logging.info("📊 今日无硬币变动记录")
+            else:
+                logging.warning("⚠️ 硬币日志查询接口返回异常，错误码：{}，信息：{}".format(
+                    data.get("code", "未知") if data else "未知",
+                    data.get("message", "未知") if data else "未知"
+                ))
+        except Exception as e:
+            logging.error(f"❌ 硬币日志查询异常：{str(e)}")
+        logging.info("=== 硬币日志查询完成 ===")
+
     def _get_video_info(self, bv):
         """获取视频信息（重试+容错）"""
         try:
@@ -277,7 +326,7 @@ class BilibiliDailyTask:
             return None
 
     def run_all_tasks(self):
-        """执行所有任务"""
+        """执行所有任务（最后执行硬币日志查询）"""
         logging.info("=== 开始执行哔哩哔哩每日任务 ===")
         logging.info(f"执行时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -285,7 +334,7 @@ class BilibiliDailyTask:
             logging.error("登录失败，终止任务")
             return
 
-        # 执行任务，大幅增加间隔
+        # 执行常规任务，大幅增加间隔
         self.daily_login()
         time.sleep(5)
 
@@ -295,8 +344,8 @@ class BilibiliDailyTask:
         self.share_video()
         time.sleep(5)
 
-        self.coin_video()
-        time.sleep(5)
+        # self.coin_video()
+        # time.sleep(5)
 
         self.comic_task()
         time.sleep(5)
@@ -308,8 +357,12 @@ class BilibiliDailyTask:
         time.sleep(5)
 
         self.silver_to_coin()
+        time.sleep(5)
 
-        logging.info("=== 哔哩哔哩每日任务执行完毕（部分任务因风控默认视为完成）===")
+        # 最后执行硬币日志查询（核心新增）
+        self.query_coin_log()
+
+        logging.info("=== 哔哩哔哩每日任务全部执行完毕（含硬币日志验证）===")
 
 if __name__ == "__main__":
     os.environ['PYTHONUNBUFFERED'] = '1'
