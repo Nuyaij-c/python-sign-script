@@ -1,9 +1,11 @@
+import base64
 import requests
 import random
 import time
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -25,6 +27,37 @@ DEFAULT_COIN_BV_POOL = [
     "BV1S2421T7xF", "BV1qW4y1a7fU", "BV1xa411J7jJ", "BV1XY411J7aG", "BV13k4y1B7Hi",
     "BV1234567890", "BV2345678901", "BV3456789012"
 ]
+AUTO_REFRESH_LOGIN_CODES = {-101}
+AUTO_REFRESH_LOGIN_MESSAGES = {"账号未登录", "未登录"}
+REQUIRED_BILI_COOKIE_KEYS = ("SESSDATA", "bili_jct")
+LOGIN_DEBUG_SCREENSHOT = "bilibili_login_debug.png"
+LOGIN_DEBUG_HTML = "bilibili_login_debug.html"
+
+
+def should_refresh_cookie(login_code, login_message):
+    """根据登录错误判断是否值得尝试自动刷新 Cookie"""
+    message = (login_message or "").strip()
+    return login_code in AUTO_REFRESH_LOGIN_CODES or message in AUTO_REFRESH_LOGIN_MESSAGES
+
+
+def build_cookie_header(cookies):
+    """将浏览器 Cookie 列表转换为请求头需要的 Cookie 字符串"""
+    pairs = []
+    for cookie in cookies:
+        name = (cookie.get("name") or "").strip()
+        value = (cookie.get("value") or "").strip()
+        domain = (cookie.get("domain") or "").strip()
+        if not name or not value:
+            continue
+        if domain and "bilibili.com" not in domain:
+            continue
+        pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
+
+
+def cookie_has_required_parts(cookie_header):
+    """判断 Cookie 是否包含维持 B 站登录态的关键字段"""
+    return all(f"{key}=" in cookie_header for key in REQUIRED_BILI_COOKIE_KEYS)
 
 class BilibiliDailyTask:
     def __init__(self):
@@ -44,6 +77,9 @@ class BilibiliDailyTask:
         self.session = self._create_retry_session()
         self.user_info = None
         self.csrf = self._extract_csrf_from_cookie()
+        self.last_login_code = None
+        self.last_login_message = ""
+        self.auto_refresh_attempted = False
 
     def _init_bv_pool(self, env_name, default_pool):
         """初始化BV数据池（从环境变量读取，英文逗号分割）"""
@@ -80,7 +116,7 @@ class BilibiliDailyTask:
         
         return selected
 
-    def _create_retry_session(self):
+    def _create_retry_session(self, cookie_value=None):
         """创建带重试机制的请求会话"""
         session = requests.Session()
         retry = Retry(
@@ -93,7 +129,7 @@ class BilibiliDailyTask:
         session.mount("http://", adapter)
         
         # 回滚后的请求头
-        BILI_COOKIE = os.getenv("BILI_COOKIE", "")
+        BILI_COOKIE = cookie_value if cookie_value is not None else os.getenv("BILI_COOKIE", "")
         HEADERS = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
             "Referer": "https://www.bilibili.com/",
@@ -114,9 +150,9 @@ class BilibiliDailyTask:
         session.headers.update(HEADERS)
         return session
 
-    def _extract_csrf_from_cookie(self):
+    def _extract_csrf_from_cookie(self, cookie_value=None):
         """从Cookie提取bili_jct"""
-        BILI_COOKIE = os.getenv("BILI_COOKIE", "")
+        BILI_COOKIE = cookie_value if cookie_value is not None else os.getenv("BILI_COOKIE", "")
         if not BILI_COOKIE:
             return ""
         for item in BILI_COOKIE.split(";"):
@@ -124,6 +160,254 @@ class BilibiliDailyTask:
             if item.startswith("bili_jct="):
                 return item.split("=")[1]
         return ""
+
+    def _apply_cookie(self, cookie_value):
+        """将新的 Cookie 应用到当前进程，保证本次运行可以继续"""
+        os.environ["BILI_COOKIE"] = cookie_value
+        self.session = self._create_retry_session(cookie_value)
+        self.user_info = None
+        self.csrf = self._extract_csrf_from_cookie(cookie_value)
+        self._log_cookie_field_status(cookie_value, "当前会话")
+
+    def _log_cookie_field_status(self, cookie_value, label):
+        """只记录关键 Cookie 字段是否存在，避免泄露真实值"""
+        status_parts = []
+        for key in ("SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5"):
+            status_parts.append(f"{key}={'SET' if f'{key}=' in cookie_value else 'UNSET'}")
+        logging.info(f"🔐 {label} Cookie 字段状态：{' | '.join(status_parts)}")
+
+    def _has_refresh_credentials(self):
+        return bool(os.getenv("BILI_USERNAME", "").strip() and os.getenv("BILI_PASSWORD", "").strip())
+
+    def _dump_login_debug_artifacts(self, driver):
+        """登录失败时保留截图和页面快照，便于排查风控或页面结构变化"""
+        try:
+            driver.save_screenshot(LOGIN_DEBUG_SCREENSHOT)
+        except Exception:
+            pass
+        try:
+            Path(LOGIN_DEBUG_HTML).write_text(driver.page_source, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _create_chrome_driver(self):
+        """创建 Selenium Chrome 驱动，优先复用 GitHub Actions runner 自带驱动"""
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1440,900")
+        options.add_argument("--lang=zh-CN")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+        chrome_binary = os.getenv("GOOGLE_CHROME_BIN", "").strip()
+        if chrome_binary:
+            options.binary_location = chrome_binary
+
+        driver_path = os.getenv("CHROMEWEBDRIVER", "").strip()
+        if driver_path:
+            driver_candidate = Path(driver_path)
+            if driver_candidate.is_dir():
+                driver_candidate = driver_candidate / "chromedriver"
+            if driver_candidate.exists():
+                driver = webdriver.Chrome(service=Service(str(driver_candidate)), options=options)
+            else:
+                driver = webdriver.Chrome(options=options)
+        else:
+            driver = webdriver.Chrome(options=options)
+
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": """
+                    Object.defineProperty(navigator, 'webdriver', {
+                      get: () => undefined
+                    });
+                """
+            },
+        )
+        return driver
+
+    def _find_first_visible_element(self, driver, selectors, timeout=20):
+        """按候选选择器顺序寻找首个可见元素"""
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            for by, selector in selectors:
+                try:
+                    elements = driver.find_elements(by, selector)
+                    for element in elements:
+                        if element.is_displayed():
+                            return element
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        raise TimeoutError(f"未找到可见元素，候选选择器：{selectors}")
+
+    def _click_first_available(self, driver, selectors, timeout=10):
+        """按候选选择器顺序点击首个可见元素"""
+        element = self._find_first_visible_element(driver, selectors, timeout=timeout)
+        driver.execute_script("arguments[0].click();", element)
+        return element
+
+    def _page_requires_human_verification(self, page_source):
+        """检测页面是否进入验证码/短信验证等人工介入流程"""
+        indicators = (
+            "验证码",
+            "安全验证",
+            "短信验证",
+            "人机验证",
+            "请完成验证",
+            "极验",
+            "geetest",
+        )
+        lowered = page_source.lower()
+        return any(indicator.lower() in lowered for indicator in indicators)
+
+    def _sync_cookie_to_github_secret(self, cookie_value):
+        """最佳努力回写最新 Cookie 到 GitHub Secrets，失败不影响当前任务继续执行"""
+        repo = os.getenv("GITHUB_REPOSITORY", "").strip()
+        repo_token = os.getenv("GH_REPO_TOKEN", "").strip()
+        if not repo or not repo_token:
+            logging.warning("⚠️ 未配置 GH_REPO_TOKEN 或 GITHUB_REPOSITORY，跳过 BILI_COOKIE Secret 同步")
+            return False
+
+        try:
+            from nacl import encoding as nacl_encoding
+            from nacl.public import PublicKey, SealedBox
+        except Exception as exc:
+            logging.warning(f"⚠️ PyNaCl 不可用，跳过 GitHub Secret 同步：{exc}")
+            return False
+
+        try:
+            owner, repo_name = repo.split("/", 1)
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {repo_token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+            key_url = f"https://api.github.com/repos/{owner}/{repo_name}/actions/secrets/public-key"
+            key_resp = requests.get(key_url, headers=headers, timeout=20)
+            key_resp.raise_for_status()
+            key_data = key_resp.json()
+
+            public_key = PublicKey(key_data["key"].encode("utf-8"), nacl_encoding.Base64Encoder())
+            sealed_box = SealedBox(public_key)
+            encrypted_value = base64.b64encode(sealed_box.encrypt(cookie_value.encode("utf-8"))).decode("utf-8")
+
+            secret_url = f"https://api.github.com/repos/{owner}/{repo_name}/actions/secrets/BILI_COOKIE"
+            update_resp = requests.put(
+                secret_url,
+                headers=headers,
+                json={
+                    "encrypted_value": encrypted_value,
+                    "key_id": key_data["key_id"],
+                },
+                timeout=20,
+            )
+            if update_resp.status_code not in (201, 204):
+                logging.warning(f"⚠️ 回写 BILI_COOKIE Secret 失败，状态码：{update_resp.status_code}")
+                return False
+
+            logging.info("✅ 已将最新 Cookie 回写到 GitHub Secret：BILI_COOKIE")
+            return True
+        except Exception as exc:
+            logging.warning(f"⚠️ 回写 BILI_COOKIE Secret 失败：{exc}")
+            return False
+
+    def try_refresh_cookie_with_browser(self):
+        """使用账号密码驱动浏览器登录，尝试刷新 Bili Cookie"""
+        username = os.getenv("BILI_USERNAME", "").strip()
+        password = os.getenv("BILI_PASSWORD", "").strip()
+        if not username or not password:
+            logging.warning("⚠️ 未配置 BILI_USERNAME 或 BILI_PASSWORD，无法自动刷新 Cookie")
+            return ""
+
+        from selenium.webdriver.common.by import By
+
+        driver = None
+        try:
+            driver = self._create_chrome_driver()
+            driver.get("https://passport.bilibili.com/login")
+            time.sleep(3)
+
+            password_tab_selectors = [
+                (By.XPATH, "//*[contains(text(), '密码登录')]"),
+                (By.XPATH, "//*[contains(text(), '账号登录')]"),
+                (By.XPATH, "//*[contains(text(), '使用密码登录')]"),
+            ]
+            try:
+                self._click_first_available(driver, password_tab_selectors, timeout=5)
+                time.sleep(1)
+            except Exception:
+                logging.info("ℹ️ 未找到密码登录切换按钮，继续尝试直接定位输入框")
+
+            username_input = self._find_first_visible_element(
+                driver,
+                [
+                    (By.CSS_SELECTOR, "input[autocomplete='username']"),
+                    (By.CSS_SELECTOR, "input[placeholder*='账号']"),
+                    (By.CSS_SELECTOR, "input[placeholder*='手机号']"),
+                    (By.CSS_SELECTOR, "input[placeholder*='邮箱']"),
+                    (By.CSS_SELECTOR, "input[type='text']"),
+                ],
+            )
+            password_input = self._find_first_visible_element(
+                driver,
+                [
+                    (By.CSS_SELECTOR, "input[autocomplete='current-password']"),
+                    (By.CSS_SELECTOR, "input[type='password']"),
+                    (By.CSS_SELECTOR, "input[placeholder*='密码']"),
+                ],
+            )
+
+            username_input.clear()
+            username_input.send_keys(username)
+            password_input.clear()
+            password_input.send_keys(password)
+
+            login_button = self._find_first_visible_element(
+                driver,
+                [
+                    (By.XPATH, "//button[contains(., '登录')]"),
+                    (By.XPATH, "//*[contains(@class, 'btn') and contains(., '登录')]"),
+                    (By.XPATH, "//*[self::div or self::a][contains(., '登录') and not(contains(., '扫码'))]"),
+                ],
+            )
+            driver.execute_script("arguments[0].click();", login_button)
+
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                cookie_value = build_cookie_header(driver.get_cookies())
+                if cookie_has_required_parts(cookie_value):
+                    self._log_cookie_field_status(cookie_value, "自动刷新后")
+                    self._sync_cookie_to_github_secret(cookie_value)
+                    logging.info("✅ 自动登录成功，已获取新的 Bili Cookie")
+                    return cookie_value
+
+                if self._page_requires_human_verification(driver.page_source):
+                    logging.error("❌ 自动登录触发验证码或二次验证，当前无法无人值守完成")
+                    self._dump_login_debug_artifacts(driver)
+                    return ""
+
+                time.sleep(1)
+
+            self._dump_login_debug_artifacts(driver)
+            logging.error("❌ 自动登录超时，未获取到完整 Cookie")
+            return ""
+        except Exception as exc:
+            logging.error(f"❌ 自动刷新 Cookie 失败：{exc}")
+            if driver:
+                self._dump_login_debug_artifacts(driver)
+            return ""
+        finally:
+            if driver:
+                driver.quit()
 
     def _safe_json_parse(self, response):
         """安全解析JSON"""
@@ -141,6 +425,8 @@ class BilibiliDailyTask:
 
     def check_login(self):
         """检查登录状态"""
+        self.last_login_code = None
+        self.last_login_message = ""
         try:
             url = "https://api.bilibili.com/x/web-interface/nav"
             resp = self.session.get(url, timeout=20)
@@ -151,11 +437,38 @@ class BilibiliDailyTask:
                 logging.info(f"✅ 登录成功！用户名：{self.user_info['uname']}，CSRF：{self.csrf}")
                 return True
             else:
-                logging.error(f"❌ 登录失败：{data['message'] if data else '未知错误'}")
+                self.last_login_code = data.get("code") if data else None
+                self.last_login_message = data.get("message") if data else "未知错误"
+                logging.error(f"❌ 登录失败：{self.last_login_message}")
                 return False
         except Exception as e:
             logging.error(f"❌ 检查登录异常：{str(e)}")
             return False
+
+    def ensure_login(self):
+        """优先使用现有 Cookie，失效时再尝试自动刷新一次"""
+        if self.check_login():
+            return True
+
+        if self.auto_refresh_attempted:
+            return False
+
+        if not should_refresh_cookie(self.last_login_code, self.last_login_message):
+            return False
+
+        if not self._has_refresh_credentials():
+            logging.error("❌ 当前 Cookie 已失效，且未配置账号密码，无法自动刷新")
+            return False
+
+        self.auto_refresh_attempted = True
+        logging.info("♻️ 检测到登录态失效，尝试使用账号密码自动刷新 Cookie")
+        refreshed_cookie = self.try_refresh_cookie_with_browser()
+        if not refreshed_cookie:
+            return False
+
+        self._apply_cookie(refreshed_cookie)
+        logging.info("✅ 已加载自动刷新后的 Cookie，重新校验登录态")
+        return self.check_login()
 
     def daily_login(self):
         """每日登录"""
@@ -377,7 +690,7 @@ class BilibiliDailyTask:
         logging.info("=== 开始执行哔哩哔哩每日任务 ===")
         logging.info(f"执行时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        if not self.check_login():
+        if not self.ensure_login():
             logging.error("❌ 登录失败，终止任务")
             return
 
