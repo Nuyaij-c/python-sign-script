@@ -101,7 +101,7 @@ class BilibiliDailyTask:
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "Origin": "https://www.bilibili.com",
             "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Encoding": "gzip, deflate",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
@@ -129,8 +129,14 @@ class BilibiliDailyTask:
         """安全解析JSON"""
         try:
             return response.json()
-        except:
-            logging.warning(f"接口返回非JSON数据，状态码：{response.status_code}，内容：{response.text[:100]}")
+        except Exception:
+            content_encoding = response.headers.get("Content-Encoding", "none")
+            content_type = response.headers.get("Content-Type", "unknown")
+            logging.warning(
+                f"接口返回非JSON数据，状态码：{response.status_code}，"
+                f"Content-Encoding：{content_encoding}，Content-Type：{content_type}，"
+                f"内容：{response.text[:100]}"
+            )
             return None
 
     def check_login(self):
